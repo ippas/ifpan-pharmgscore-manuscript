@@ -1,0 +1,335 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+```{r}
+library(ggplot2)
+library(tidyverse)
+library(gridExtra)
+library(svglite)
+library(scales)
+library(rstatix)
+library(precrec)
+```
+
+```{r}
+gg_qqplot <- function(ps, ci = 0.95) {
+  n  <- length(ps)
+  df <- data.frame(
+    observed = -log10(sort(ps)),
+    expected = -log10(ppoints(n)),
+    clower   = -log10(qbeta(p = (1 - ci) / 2, shape1 = 1:n, shape2 = n:1)),
+    cupper   = -log10(qbeta(p = (1 + ci) / 2, shape1 = 1:n, shape2 = n:1))
+  )
+  log10Pe <- expression(paste("Expected -log"[10], plain(P)))
+  log10Po <- expression(paste("Observed -log"[10], plain(P)))
+  ggplot(df) +
+    # geom_ribbon(
+    #   mapping = aes(x = expected, ymin = clower, ymax = cupper),
+    #   alpha = 0.1
+    # ) +
+    geom_point(aes(expected, observed), shape = 16, size = 1) +
+    geom_abline(intercept = 0, slope = 1, alpha = 0.5) +
+    # geom_line(aes(expected, cupper), linetype = 2, size = 0.5) +
+    # geom_line(aes(expected, clower), linetype = 2, size = 0.5) +
+    xlab(log10Pe) +
+    ylab(log10Po)
+}
+
+
+inflation <- function(ps) {
+  chisq <- qchisq(1 - ps, 1)
+  lambda <- median(chisq) / qchisq(0.5, 1)
+  lambda
+}
+```
+
+```{r}
+burden <- read_tsv('data/genes-list-pgs-burden.tsv')
+```
+
+```{r}
+cyps <- c(
+  'CYP1A2', 'CYP2B6', 'CYP2C19', 'CYP2C8', 'CYP2C9', 'CYP2D6', 'CYP2E1',
+  'CYP3A4', 'CYP3A5', 'CYPs', 'CYPs without CYP2D6'
+)
+
+burden.cyps <-
+  burden %>%
+  filter(gene_name %in% cyps) %>%
+  mutate(pgs = if_else(pgs < 50, 0, pgs)) %>%
+  group_by(s) %>%
+  summarise(pgs_sum = sum(pgs)) %>%
+  rename(pgs = pgs_sum) %>%
+  mutate(gene_name = 'CYPs')
+
+burden.cyps.without.2d6 <-
+  burden %>%
+  filter(gene_name %in% cyps) %>%
+  filter(gene_name != 'CYP2D6') %>%
+  mutate(pgs = if_else(pgs < 50, 0, pgs)) %>%
+  group_by(s) %>%
+  summarise(pgs_sum = sum(pgs)) %>%
+  rename(pgs = pgs_sum) %>%
+  mutate(gene_name = 'CYPs without CYP2D6')
+```
+
+```{r, fig.width=15, fig.height=5}
+burden.cyps.groups <-
+  burden %>%
+  bind_rows(burden.cyps) %>%
+  bind_rows(burden.cyps.without.2d6)
+
+n_threshold_50 <-
+  burden.cyps.groups %>%
+  filter(gene_name %in% cyps) %>%
+  mutate(over_50 = if_else(pgs > 50, "high_pgs", "low_pgs")) %>%
+  group_by(gene_name, over_50) %>%
+  summarise(n_50 = n()) %>%
+  filter(gene_name != 'CYPs') %>%
+  filter(gene_name != 'CYPs without CYP2D6') %>%
+  pivot_wider(names_from = "over_50", values_from = "n_50")
+
+n_threshold_100 <-
+  burden.cyps.groups %>%
+  filter(gene_name %in% c('CYPs', 'CYPs without CYP2D6')) %>%
+  mutate(over_100 = if_else(pgs > 100, "high_pgs", "low_pgs")) %>%
+  group_by(gene_name, over_100) %>%
+  summarise(n_100 = n()) %>%
+  pivot_wider(names_from = "over_100", values_from = "n_100")
+
+burden.plot <-
+  burden.cyps.groups %>%
+  filter(gene_name %in% cyps) %>%
+  left_join(
+    bind_rows(n_threshold_50, n_threshold_100),
+    by = "gene_name"
+  )
+
+g <- ggplot(burden.plot, aes(x = pgs)) +
+  geom_histogram(binwidth = 5) +
+  geom_vline(xintercept = 50) +
+  geom_vline(xintercept = 100) +
+  scale_y_continuous(
+    trans=scales::pseudo_log_trans(base = 10),
+    breaks = c(0, (10^rep(0:10))),
+  ) +
+  geom_text(aes(x = 75, y = 1000, label = high_pgs), check_overlap = TRUE) +
+  geom_text(aes(x = 20, y = 1000, label = low_pgs), check_overlap = TRUE) +
+  theme_minimal() +
+  labs(
+    title = "Burden (PGS) of a gene (group of genes)",
+  )
+g <- g + facet_grid(rows = vars(gene_name))
+ggsave('results/manuscript/histograms-cyps-groups.svg', width = 15, height=20)
+```
+
+```{r}
+pvals <- read_tsv('data/gwas-pgs/pvals-for-qqplot.tsv')
+
+set.seed(1234)
+pvalue <- runif(10000, min=0, max=1)
+
+pvals_ctrl <-
+  pvals %>%
+  filter(is.finite(adr_control)) %>%
+  pull(adr_control)
+gg_qqplot(pvals_ctrl) +
+  coord_fixed(1, c(0, 7), c(0, 7)) +
+  theme_minimal()
+inflation(pvals_ctrl)
+ggsave('results/manuscript/qqplot-adr-control.svg', width = 5, height=5)
+
+pvals_ctrl_ad_relevant <-
+  pvals %>%
+  filter(is.finite(adr_control_ad_relevant)) %>%
+  pull(adr_control_ad_relevant)
+gg_qqplot(pvals_ctrl_ad_relevant[1:60]) +
+  coord_fixed(1, c(0, 3), c(0, 3)) +
+  theme_minimal()
+inflation(pvals_ctrl_ad_relevant)
+ggsave('results/manuscript/qqplot-adr-control-ad-relevant.svg', width = 5, height=5)
+```
+
+```{r mean_cyp_burden_of_adr_control_groups}
+bp <-
+  read_tsv('results/manuscript/pgs-burden-groups-comparison-groups.tsv') %>%
+  filter(burden_group == 'cyps') %>%
+  mutate(comp_1 = group) %>%
+  mutate(comp_4 = if_else(
+    group == 'adr',
+    as.character(NA),  # 'adr',
+    if_else(
+      mental_health_inpatient %in% c('anxiety', 'both', 'depression'),
+      'control-mhi',
+      as.character(NA)
+    )
+  )) %>%
+  mutate(comp_5 = if_else(
+    group == 'adr',
+    as.character(NA),  # 'adr',
+    if_else(self_harm == 'with_drugs', 'control-with_drugs', as.character(NA))
+  )) %>%
+  mutate(comp_6 = if_else(
+    group == 'adr',
+    if_else(intention == 'intentional', 'adr-intentional', 'control-adr-accidental'),
+    as.character(NA)
+  )) %>%
+  select(s, pgs, contains('comp_'))
+
+columns_order <- c(
+  'adr', 'control-adr-accidental', 'adr-intentional',
+  'control', 'control-mhi', 'control-with_drugs'
+)
+bp_plot <-
+  bp %>%
+  pivot_longer(contains('comp_'), names_to = 'comp', values_to = 'group') %>%
+  filter(!is.na(group)) %>%
+  mutate(group = factor(group, levels = columns_order)) %>%
+  group_by(group) %>%
+  summarise(mean_pgs = mean(pgs), sem = sd(pgs) / sqrt(n()))
+
+ggplot(bp_plot, aes(x = group, y = mean_pgs)) +
+  geom_bar(stat = 'identity', width = 0.7) +
+  geom_errorbar(
+    aes(ymin = mean_pgs - sem, ymax = mean_pgs + sem),
+    width = 0.2,
+  ) +
+  theme_minimal()
+ggsave(
+  'results/manuscript/cyp-group-pgs-burden-comparison-groups.svg',
+  width = 8,
+  height = 5
+)
+```
+
+```{r pairwise_t_test_for_adr_control_groups}
+bp_stat <-
+  bp %>%
+  pivot_longer(
+    contains('comp_'),
+    names_to = NULL,
+    values_to = 'group'
+  ) %>%
+  filter(!is.na(group))
+
+bp_pairwise_t_test <-
+  pairwise_t_test(
+    bp_stat,
+    pgs ~ group,
+    paired = FALSE,
+    pool.sd = TRUE,
+    p.adjust.method = 'bonferroni',
+    comparisons = list(
+      c('adr', 'control'),
+      c('adr', 'control-mhi'),
+      c('adr', 'control-with_drugs'),
+      c('adr-intentional', 'control'),
+      c('adr-intentional', 'control-mhi'),
+      c('adr-intentional', 'control-with_drugs'),
+      c('control-adr-accidental', 'control'),
+      c('control-adr-accidental', 'control-mhi'),
+      c('control-adr-accidental', 'control-with_drugs')
+    )
+  ) %>%
+  select(-.y.)
+```
+
+```{r wilcox_test}
+pvals = c()
+for(gr1 in c('adr', 'adr-intentional', 'control-adr-accidental')){
+  for(gr2 in c('control', 'control-mhi', 'control-with_drugs')){
+    x <- bp_stat %>% filter(group == gr1) %>% pull(pgs)
+    y <- bp_stat %>% filter(group == gr2) %>% pull(pgs)
+    pvals <- c(pvals, wilcox.test(x, y)$p.value)
+  }
+}
+bp_pairwise_t_test %>%
+  mutate(wc = pvals, p.adjust(wc, method = 'bonferroni'))
+```
+
+```{r pgs_burden_for_cyps_list_all_roc_comparison}
+cg <-
+  read_tsv('results/manuscript/pgs-burden-groups-comparison-groups.tsv') %>%
+  pivot_wider(names_from = burden_group, values_from = pgs) %>%
+  mutate(intention = factor(
+      intention, levels = c(
+        "control", "intentional", "therapeutic", "accidental", "unspecified"
+      )
+  ))
+levels(cg$intention) <- c(
+  "control", "control", "accidental", "accidental", "accidental"
+)
+
+ct_m <-
+  cg %>%
+  mutate(fun = cyps > 100) %>%
+  group_by(fun, intention) %>%
+  summarise(n = n())
+
+a <- ct_m %>% filter(fun) %>% arrange(intention) %>% pull(n)
+b <- ct_m %>% filter(!fun) %>% arrange(intention) %>% pull(n)
+m <- matrix(c(a, b), nrow = 2, byrow = TRUE)
+fisher.test(m)
+```
+
+```{r}
+precrec_obj_ <- mmdata(
+  scores = list(
+    cg$cyps,
+    cg$list,
+    cg$`all-protein`
+  ),
+  labels = cg$intention,
+  modnames = c('CYPs', 'list', 'all')
+)
+precrec_obj <- evalmod(precrec_obj_)
+
+data.frame(evalmod(precrec_obj_, mode = "aucroc"))
+p_roc <- autoplot(precrec_obj, ret_grob = TRUE, curvetype = "ROC")
+p_prc <- autoplot(precrec_obj, ret_grob = TRUE, curvetype = "PRC")
+param_str = 'adr accidental/therapeutic/unspecified'
+p <- grid.arrange(
+  p_roc + labs(subtitle = param_str) + theme(legend.position = "bottom"),
+  p_prc + labs(subtitle = param_str) + theme(legend.position = "bottom"),
+  nrow = 1
+)
+
+ggsave(
+  paste0(
+    "results/manuscript/", "fig4-roc-",
+    format(Sys.time(), "%d"),
+    "-", format(Sys.time(), "%H-%M-%S"),
+    ".svg"
+  ),
+  plot = p,
+  width = 20,
+  height = 12,
+  units = "cm",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+```{r logistic_regression_adr_accidental}
+cg <-
+  read_tsv('results/manuscript/pgs-burden-groups-comparison-groups.tsv') %>%
+  pivot_wider(names_from = burden_group, values_from = pgs) %>%
+  mutate(intention = factor(
+      intention, levels = c(
+        "control", "intentional", "therapeutic", "accidental", "unspecified"
+      )
+  ))
+levels(cg$intention) <- c(
+  "control", "control", "accidental", "accidental", "accidental"
+)
+
+model <- glm(intention ~ cyps, family = binomial(link = 'logit'), data = cg)
+summary(model)
+model <- glm(intention ~ cyps_without_2d6, family = binomial(link = 'logit'), data = cg)
+summary(model)
+```
