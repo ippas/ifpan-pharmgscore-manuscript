@@ -1,1 +1,1 @@
-# Impact of pharmacogenetic profiles on depression treatment outcomes
+# Computational variant predictors for pharmacogenomics: from evaluation of single alleles to assessment of adverse drug reactions to antidepressants

@@ -1,15 +1,44 @@
 import os
 import requests
 import time
+import pickle
+from pathlib import Path
+from dataclasses import dataclass
 
 import pandas as pd
 import hail as hl
 from tqdm import tqdm
 
 from analysis.utils.liftover import liftover_vcf
+from analysis.utils.pharmvar import is_sub, dist_to_feature
+from analysis.utils.score_colnames import (
+    info,
+    functional_predictions_score, functional_predictions_rankscore,
+    conservation_scores, conservation_rankscores
+)
 
 
-RESOURCES_PATH = '/net/archive/groups/plggneuromol/resources/'
+SC_TRANSLATE = {
+    'adme': 'APF',
+    'adme2': 'APF2',
+    'pgs': 'PharmGScore',
+    'cadd': 'CADD',
+    'fathmm_xf': 'FATHMM-XF',
+    'ma': 'MutationAssessor',
+    'provean': 'PROVEAN',
+    'pmls_pred': 'PharmMLScore',
+    'sift': 'SIFT',
+    'phylop100': 'PhyloP100'
+}
+
+
+@dataclass
+class ScoreInfo:
+    col_name: str
+    limits: tuple
+    deleterious_on_right: bool
+    threshold: float = 0
+
 
 
 class CADD:
@@ -98,7 +127,7 @@ class CADD:
         )
 
         cadd.write(cls.table_path)
-    
+
     @classmethod
     def read_table(cls):
         return hl.read_table(cls.table_path)
@@ -122,16 +151,9 @@ class FathmmXF:
 
     (http://fathmm.biocompute.org.uk/fathmm-xf/)
 
-
-    This base has a duplicated variants (about 0.3%). Comparing around 1000
-    duplicated scores from the database with the ones retrived online it seems
-    it's enough to do `hl.distinct()`. Example variants:
-        * chr8:144138786 G/A/C/T
-        * chr1:146989574 G/A/C/T - 7 scores for each variant
     """
 
-
-    table_path = os.path.join(RESOURCES_PATH, 'fathmm-xf.ht')
+    table_path_phred = os.path.join(RESOURCES_PATH, 'fathmm-xf-phred.ht')
 
     def __init__(self):
         pass
@@ -141,7 +163,7 @@ class FathmmXF:
 
     @classmethod
     def read_table(cls):
-        return hl.read_table(cls.table_path)
+        return hl.read_table(cls.table_path_phred)
 
     @classmethod
     def _write_as_hailtable(cls, bgz_files):
@@ -244,7 +266,7 @@ class FathmmXF:
                     'chain-files-for-liftover/grch38_to_grch37.over.chain.gz'
                 )
             )
-            vcf_input = vcf_input.checkpoint(next(tmpdir_path))
+            vcf_input = vcf_input.persist()
 
         loci = vcf_input.locus.collect()
         alleles = vcf_input.alleles.collect()
@@ -263,73 +285,33 @@ class dbNSFP:
     More info: dbNSFP4.3a.readme.txt"""
 
     table_path = os.path.join(RESOURCES_PATH, 'dbNSFP4.3a', 'dbNSFP4.3a.ht')
+    table_path_single = os.path.join(
+        RESOURCES_PATH, 'dbNSFP4.3a', 'dbNSFP4.3a-single.ht'
+    )
 
     @staticmethod
     def _to_float32_with_missing(score_str):
         score_str = hl.if_else(
-            score_str.matches('^\.$'),
+            score_str.matches('^\.|-$|^$'),  # MutPred - no values indicated by '-'
             hl.missing('str'),
-            score_str
+            hl.if_else(
+                score_str.matches('\|'),
+                hl.str(hl.max(score_str.split('\|').map(hl.float32))),
+                score_str
+            )
         )
         return hl.float32(score_str)
-
-    def convert_subset(self, dbnsfp_subset_path):
-        to_do_nothing = [
-        ]
-        to_split = [
-        ]
-        to_split_arrayfloat = [
-            'MutationAssessor_score',
-            'PROVEAN_score',
-        ]
-        to_float = [
-            'MutationAssessor_rankscore',
-            'PROVEAN_converted_rankscore',
-        ]
-        SCORE_COLS = to_do_nothing + to_split + to_split_arrayfloat + to_float
-        annot_cols = ['genename', 'Ensembl_geneid', 'Ensembl_transcriptid']
-
-        if os.path.exists(dbnsfp_subset_path):
-            return hl.read_table(dbnsfp_subset_path)
-
-        dbnsfp = self.read_table()
-        dbnsfp = dbnsfp.select(
-            *annot_cols, *SCORE_COLS,
-        )
-        dbnsfp = dbnsfp.annotate(
-            **{
-                col: dbnsfp[col].split(';') for col in annot_cols + to_split
-            },
-            **{
-                col: hl.float32(dbnsfp[col]) for col in to_float
-            },
-            **{
-                col: hl.map(self._to_float32_with_missing, dbnsfp[col].split(';'))
-                for col in to_split_arrayfloat
-            }
-        )
-        dbnsfp = dbnsfp.annotate(
-            **{
-                'mutation_assessor': hl.max(dbnsfp['MutationAssessor_score']),  # -5.17-6.49; >0.65 H(igh)/M/L/N(eutral) 3.5/1.935/0.8???
-                'provean': hl.min(dbnsfp['PROVEAN_score']),  # -14-14; <=-2.5 D
-                }
-            )
-        dbnsfp = dbnsfp.repartition(1000)  # can't read table later without it
-        dbnsfp.write(dbnsfp_subset_path)
-
-        return hl.read_table(dbnsfp_subset_path)
 
     @classmethod
     def _write_as_hailtable(cls, dbnsf_path):
         """dbNSFP downloaded from: https://sites.google.com/site/jpopgen/dbNSFP
         (googledrive)
-        Then variants converted from *.gz to *.bgz with bgzip (htslib/samtools)
         """
         dbnsfp = hl.import_table(
             dbnsf_path,
             min_partitions=3600,
             missing='.',
-            impute=False,  # NotImplementedError 'str' + 'int32'
+            impute=False,
         )
         dbnsfp = dbnsfp.key_by(
             **hl.parse_variant(
@@ -342,92 +324,66 @@ class dbNSFP:
         dbnsfp.write(cls.table_path)
 
     @classmethod
-    def read_table(cls):
-        return hl.read_table(cls.table_path)
+    def convert_to_single_score(cls):
+        dbnsfp = cls.read_table(single=False)
 
+        info = info + ['MutationTaster_pred']
+        all_score_cols = (info
+        + functional_predictions_score
+        + functional_predictions_rankscore
+        + conservation_scores
+        + conservation_rankscores)
 
-class DANN:
-    """DANN is a functional prediction score retrained based on the
-    training data of CADD using deep neural network. Scores range from
-    0 to 1. A larger number indicate a higher probability to be damaging.
+        dbnsfp = dbnsfp.select(
+            *all_score_cols
+        )
 
-    DANN scores were downloaded from
-    https://cbcl.ics.uci.edu/public_data/DANN/data/ and liftovered from
-    GRCh37 to GRCh38.
-    """
-
-    table_path = os.path.join(RESOURCES_PATH, 'dann.ht')
-
-    def __init__(self):
-        pass
-
-    def get_scores(self, vcf=None):
-        pass
-
-    @classmethod
-    def read_table(cls):
-        return hl.read_table(cls.table_path)
-
-    @classmethod
-    def _write_as_hailtable(cls, bgz_file):
-        dann = hl.import_table(
-            bgz_file,
-            no_header=True,
-            min_partitions=5000,
-            types={
-                'f4': hl.tfloat32,
+        dbnsfp = dbnsfp.annotate(
+            **{
+                col: dbnsfp[col].split(';') for col in info
+            },
+            **{
+                col: dbnsfp[col].split(';').map(_to_float32_with_missing)
+                for col in all_score_cols if col not in info
+            },
+        )
+        dbnsfp = dbnsfp.annotate(
+            VEP_canonical_index=dbnsfp['VEP_canonical'].index('YES'),
+        )
+        dbnsfp = dbnsfp.annotate(
+            single={
+                col:
+                hl.if_else(
+                    hl.is_defined(dbnsfp['VEP_canonical_index']),
+                    hl.if_else(
+                        (dbnsfp[col].length() == 1) | (hl.len(dbnsfp['VEP_canonical']) > hl.len(dbnsfp[col])),
+                        dbnsfp[col][0],
+                        dbnsfp[col][dbnsfp['VEP_canonical_index']]
+                    ),
+                    dbnsfp[col][0] if col in info else hl.mean(dbnsfp[col])
+                )
+                for col in all_score_cols
             }
         )
-        dann = dann.select(
-            chr=dann.f0,
-            position=dann.f1,
-            ref=dann.f2,
-            alt=dann.f3,
-            score=dann.f4,
-        )
-        dann = dann.key_by(
-            **hl.parse_variant(
-                dann['chr'] + ':'
-                    + dann['position'] + ':'
-                    + dann['ref'] + ':'
-                    + dann['alt'],
-                reference_genome='GRCh37'
-            )
-        )
+        dbnsfp.write(cls.table_path_single)
 
-        dann_38 = liftover_vcf(
-            dann,
-            'GRCh37',
-            'GRCh38',
-            os.path.join(
-                RESOURCES_PATH,
-                'chain-files-for-liftover',
-                'grch37_to_grch38.over.chain.gz'
-            )
-        )
-        dann_38 = dann_38.select(
-            'score'
-        )
-
-        dann_38.write(cls.table_path)
+    @classmethod
+    def read_table(cls, single=True):
+        if single:
+            return hl.read_table(cls.table_path_single)
+        else:
+            return hl.read_table(cls.table_path)
 
 
 class PharmGScore:
     """PharmGScore table contains normalized scores for computing the
     PharmGScore. This score is an ensemble of four other scores: CADD,
-    FATHMM XF, PROVEAN and MutationAssessor. DANN score in the table
-    is NOT normalized.
+    FATHMM-XF, PROVEAN and MutationAssessor.
 
-    PharmGScore scores bgz file was produced by merging files:
-        cat gene-our-scores/*.tsv | head -n 1 | bgzip > our-scores.tsv.bgz && \
-        cat gene-our-scores/*.tsv | tail -n +2 | bgzip --threads 7 >> \
-        our-scores.tsv.bgz
-
-    with normalized scores genereated by the following script:
-        analysis/star_alleles_burden/burden_function_plots.Rmd
+    preparation: pharm_g_score/make_pgs_score.py
     """
 
-    table_path = os.path.join(RESOURCES_PATH, 'pharm-g-score-scores.ht')
+    table_path = os.path.join(RESOURCES_PATH, 'pharm-g-score-60.ht')
 
     def __init__(self):
         pass
@@ -439,142 +395,433 @@ class PharmGScore:
     def read_table(cls):
         return hl.read_table(cls.table_path)
 
+
+class ADME2:
+    """ADME2 optimized predcition framework
+    https://www.nature.com/articles/s41397-018-0044-2"""
+
+    table_path = None
+    adme_score_info = {
+        'AlphaMissense': ScoreInfo('AM', (0, 1), True, 0.152),
+        'PROVEAN': ScoreInfo('PROVEAN', (-15, 5), False, -3.2925),
+        'MutationAssessor': ScoreInfo('MutationAssessor', (-4, 6), True, 2.08),
+        'Polyphen2_HVAR': ScoreInfo('Polyphen2_HVAR', (0, 1), True, 0.42),
+        'VEST4': ScoreInfo('VEST4', (0, 1), True, 0.2905),
+    }
+
+    def __init__(self):
+        pass
+
+    @classmethod
+    def read_table(cls):
+        pass
+
     @classmethod
     def _write_as_hailtable(cls, bgz_file):
-        pgs = hl.import_table(
-            bgz_file,
-            types={
-                'locus': hl.tstr,
-                'allele_1': hl.tstr,
-                'allele_2': hl.tstr,
-                'gene_name': hl.tstr,
-                'dist_to_exon': hl.tint32,
-                'dist_to_gene': hl.tint32,
-                'gnomad_nfe_AF': hl.tfloat32,
-                'in_gnomad': hl.tbool,
-                'cadd_raw': hl.tfloat32,
-                'mutation_assessor': hl.tfloat32,
-                'provean': hl.tfloat32,
-                'fathmm_xf': hl.tfloat32,
-                'dann': hl.tfloat32,  # it's oryginal score, not normalized
-                'cadd_raw_oryg': hl.tfloat32,
-                'fathmm_xf_oryg': hl.tfloat32,
-                'provean_oryg': hl.tfloat32,
-                'mutation_assessor_oryg': hl.tfloat32,
-            },
-        )
-        pgs = pgs.annotate(
-            scores=hl.array([
-                pgs.cadd_raw,
-                pgs.mutation_assessor,
-                pgs.provean,
-                pgs.fathmm_xf
-            ])
-        )
-        pgs = pgs.transmute(
-            pgs=hl.if_else(
-                hl.all(hl.map(hl.is_missing, pgs.scores)),
-                0,
-                hl.mean(pgs.scores)
-            )
-        )
-
-        pgs = pgs.annotate(
-            **hl.parse_variant(
-                pgs.locus + ':' + pgs.allele_1 + ':' + pgs.allele_2
-            )
-        )
-        pgs = pgs.drop('allele_1', 'allele_2')
-
-        key_cols = ['locus', 'alleles', 'gene_name']
-        pgs = pgs.key_by(*key_cols)
-        # reorder columns
-        pgs = pgs.select(
-            *[col for col in pgs._fields.keys() if col not in key_cols]
-        )
-        pgs = pgs.repartition(12000)
-
-        pgs.write(cls.table_path)
-
-    @staticmethod
-    def _score_aggregator(expr_score, expr_gt):
-        return hl.if_else(
-            hl.agg.all(hl.is_missing(expr_score) | expr_gt.is_hom_ref()),
-            hl.missing(hl.tfloat),
-            hl.agg.sum(expr_score * expr_gt.n_alt_alleles())
-        )
+        pass
 
     @classmethod
-    def compute_burden(cls, vcf):
+    def compute_score(cls, vcf):
         """Annotate vcf with burden scores and then compute PGS score"""
-        vcf = hl.split_multi_hts(vcf, permit_shuffle=True)
-        # TODO: remove non-variant sites?
-        vcf = vcf.semi_join_rows(cls.read_table())
-        vcf = vcf.annotate_rows(
-            **cls.read_table()[vcf.row_key]
+        am = AlphaMissense.read_table()
+        dbnsfp = dbNSFP()
+        db = dbnsfp.read_table()
+
+        if isinstance(vcf, hl.Table):
+            key = vcf.key
+        else:
+            key = vcf.row_key
+
+        scores = hl.struct(
+            am=am[key].am_pathogenicity,
+            provean=db[key].single.PROVEAN_score,
+            mutation_assessor=db[key].single.MutationAssessor_score,
+            polyphen=db[key].single.Polyphen2_HVAR_score,
+            vest=db[key].single.VEST4_score,
         )
 
-        vcfe = vcf.entries()
-        vg = vcfe.group_by('s', 'gene_name').aggregate(
-            n=hl.agg.sum(vcfe.GT.n_alt_alleles()),
-            cadd_raw=cls._score_aggregator(vcfe.cadd_raw, vcfe.GT),
-            fathmm_xf=cls._score_aggregator(vcfe.fathmm_xf, vcfe.GT),
-            provean=cls._score_aggregator(vcfe.provean, vcfe.GT),
-            mutation_assessor=cls._score_aggregator(vcfe.mutation_assessor, vcfe.GT),
-            score_1=hl.agg.sum(vcfe.cadd_raw_oryg * vcfe.GT.n_alt_alleles()),
-            score_2=hl.agg.sum(vcfe.fathmm_xf_oryg * vcfe.GT.n_alt_alleles()),
-            score_3=hl.agg.sum(vcfe.provean_oryg * vcfe.GT.n_alt_alleles()),
-            score_4=hl.agg.sum(vcfe.mutation_assessor_oryg * vcfe.GT.n_alt_alleles()),
+        adme_components = [
+            scores.am >= cls.adme_score_info['AlphaMissense'].threshold,
+            scores.provean < cls.adme_score_info['PROVEAN'].threshold,
+            scores.mutation_assessor > cls.adme_score_info['MutationAssessor'].threshold,
+            scores.polyphen > cls.adme_score_info['Polyphen2_HVAR'].threshold,
+            scores.vest > cls.adme_score_info['VEST4'].threshold,
+        ]
+
+        adme = hl.mean(adme_components)
+
+        return hl.struct(
+            adme_component_scores2=scores,
+            adme_components2=adme_components,
+            adme2=hl.if_else(hl.is_nan(adme), hl.missing(hl.tfloat64), adme),
         )
-        vg = vg.annotate(
-            scores=hl.array(
-                [vg.cadd_raw, vg.fathmm_xf, vg.provean, vg.mutation_assessor]
-            ),
+
+
+class ADME:
+    """ADME optimized predcition framework
+    https://www.nature.com/articles/s41397-018-0044-2"""
+
+    table_path = None
+    adme_score_info = {
+        'LRT': ScoreInfo('LRT', (0, 1), False, 0.0025),
+        'MutationAssessor': ScoreInfo('MutationAssessor', (-4, 6), True, 2.0566),
+        'PROVEAN': ScoreInfo('PROVEAN', (-15, 5), False, -3.286),
+        'VEST': ScoreInfo('VEST4', (0, 1), True, 0.4534),
+        'CADD': ScoreInfo('CADD', (0, 60), True, 19.19),
+    }
+
+    def __init__(self):
+        pass
+
+    @classmethod
+    def read_table(cls):
+        pass
+
+    @classmethod
+    def _write_as_hailtable(cls, bgz_file):
+        pass
+
+    @classmethod
+    def compute_score(cls, vcf):
+        """Annotate vcf with burden scores and then compute PGS score"""
+        cadd = CADD.read_table()
+        dbnsfp = dbNSFP()
+        db = dbnsfp.read_table()
+
+        if isinstance(vcf, hl.Table):
+            key = vcf.key
+        else:
+            key = vcf.row_key
+
+        scores = hl.struct(
+            lrt=db[key].single.LRT_score,
+            mutation_assessor=db[key].single.MutationAssessor_score,
+            provean=db[key].single.PROVEAN_score,
+            vest=db[key].single.VEST4_score,
+            cadd=cadd[key].score_phred,
         )
-        vg = vg.annotate(
-            burden=hl.if_else(
-                vg.scores.all(hl.is_missing),
-                0,
-                hl.mean(vg.scores),
+
+        adme_components = [
+            scores.lrt < cls.adme_score_info['LRT'].threshold,
+            scores.mutation_assessor > cls.adme_score_info['MutationAssessor'].threshold,
+            scores.provean < cls.adme_score_info['PROVEAN'].threshold,
+            scores.vest > cls.adme_score_info['VEST'].threshold,
+            scores.cadd > cls.adme_score_info['CADD'].threshold,
+        ]
+
+        adme = hl.mean(adme_components)
+
+        return hl.struct(
+            adme_component_scores=scores,
+            adme_components=adme_components,
+            adme=hl.if_else(hl.is_nan(adme), hl.missing(hl.tfloat64), adme),
+        )
+
+
+class AlphaMissense:
+    """AlphaMissense is a machine learning-based tool that uses unsupervised
+    protein language modeling and structural context from AlphaFold to predict
+    the pathogenicity of missense genetic variants in proteins.
+    https://www.science.org/doi/10.1126/science.adg7492"""
+
+    table_path = os.path.join(
+        RESOURCES_PATH,
+        'alphamissense',
+        'alphamissense.ht'
+    )
+
+    def __init__(self):
+        pass
+
+    @classmethod
+    def read_table(cls):
+        return hl.read_table(cls.table_path)
+
+    @classmethod
+    def _write_as_hailtable(cls, bgz_file):
+        bgz_file = os.path.join(RESOURCES_PATH, 'alphamissense', 'AlphaMissense_hg38.tsv.gz')
+        am = hl.import_table(
+            bgz_file,
+            force_bgz=True,
+            min_partitions=48,
+            comment=[r'^#\s.*', r'^#$'],
+            types={
+                'am_pathogenicity': hl.tfloat32,
+            }
+        )
+        am = am.key_by(
+            **hl.parse_variant(
+                am['#CHROM'] + ':'
+                    + am['POS'] + ':'
+                    + am['REF'] + ':'
+                    + am['ALT'],
+                reference_genome='GRCh38'
             )
         )
-        return vg
+        am = am.select('transcript_id', 'am_pathogenicity')
+
+        am.write(cls.table_path)
 
 
-if __name__ == '__main__':
-    from analysis.utils.load_spark import hl_init, wd
-    from analysis.utils.load_spark import tmpdir_path_iter
-
-    hl_init()
-    hl.plot.output_notebook()
-    tmpdir_path = tmpdir_path_iter()
-
-    f = FathmmXF._write_as_hailtable({
-        'coding': wd + 'raw/scores/fathmm-xf/fathmm_xf_coding_hg38.vcf.gz',
-        'noncoding': wd + 'raw/scores/fathmm-xf/fathmm_xf_noncoding_hg38.vcf.gz'
-    })
-
-    # dbNSFP exports
-    dbNSFP._write_as_hailtable(
-        wd + 'raw/scores/dbNSFP4.3a/dbNSFP4.3a_variant.chr*.bgz',
+def annotate_vcf_with_scores(vcf, scores=None, af=True):
+    # annotation with basic informations
+    genes_positions = pd.read_csv(
+        'data/pharmacogenetic-score/genes-position.tsv',
+        sep='\t',
+        low_memory=False
     )
+    cadd = CADD.read_table()
+    fathmm_xf = FathmmXF.read_table()
+    pgs = PharmGScore.read_table()
 
-    dbnsfp = dbNSFP()
-    dbnsfp.convert_subset(
-        dbnsfp_subset_path=os.path.join(
-            '/net/people/plgjacekh/projects/ifpan-gosborcz-ukb/',
-            'data/scores/dbNSFP4.3a-subset.ht'
+    adme = ADME()
+    adme2 = ADME2()
+    dbnsfp = dbNSFP.read_table(single=False)
+    nsfp = dbNSFP.read_table(single=True)
+
+    if 'star_allele' in vcf.row:
+        vcf = vcf.annotate(
+            is_sub=is_sub(vcf)
+        )
+    if 'gene_name' not in vcf.row:
+        vcf = vcf.annotate(
+            gene_name=pgs[vcf.key].gene_name[0]
+        )
+    vcf = vcf.annotate(
+        dist_to_exon=dist_to_feature(vcf, genes_positions, feature='exon')
+    )
+    vcf = vcf.persist()
+
+    # splitted because of performance issues
+    vcf = vcf.annotate(scores=hl.struct(
+        pgs=pgs[vcf.key].pgs[0],
+        cadd=cadd[vcf.key].score_raw,
+        cadd_phred=cadd[vcf.key].score_phred,
+        fathmm_xf=fathmm_xf[vcf.key].score,
+        fathmm_xf_phred=fathmm_xf[vcf.key].phred,
+        ma=nsfp[vcf.key].single.MutationAssessor_score,
+        af=hl.float(dbnsfp[vcf.key].gnomAD_genomes_AF),
+    ))
+    vcf = vcf.persist()
+
+    vcf = vcf.annotate(scores=vcf.scores.annotate(
+        sift_phred=phred_rankscore_col(nsfp[vcf.key].single.SIFT_converted_rankscore),
+        phylop100_phred=phred_rankscore_col(nsfp[vcf.key].single.phyloP100way_vertebrate_rankscore),
+        ma_phred=phred_rankscore_col(nsfp[vcf.key].single.MutationAssessor_rankscore),
+
+        sift=-nsfp[vcf.key].single.SIFT_score,
+    ))
+    # vcf = vcf.persist()
+
+    vcf = vcf.annotate(scores=vcf.scores.annotate(
+        provean=-nsfp[vcf.key].single.PROVEAN_score,
+        phylop100=nsfp[vcf.key].single.phyloP100way_vertebrate,
+        provean_phred=phred_rankscore_col(nsfp[vcf.key].single.PROVEAN_converted_rankscore),
+
+        dann_phred=phred_rankscore_col(nsfp[vcf.key].single.DANN_rankscore),
+        eigen_pc_phred=phred_rankscore_col(nsfp[vcf.key].single['Eigen-PC-raw_coding_rankscore' ]),
+
+        bstatistic_phred=phred_rankscore_col(nsfp[vcf.key].single.bStatistic_converted_rankscore),
+        clinpred_phred=phred_rankscore_col(nsfp[vcf.key].single.ClinPred_rankscore),
+        fathmm_phred=phred_rankscore_col(nsfp[vcf.key].single.FATHMM_converted_rankscore),
+        genocanyon_phred=phred_rankscore_col(nsfp[vcf.key].single.GenoCanyon_rankscore),
+        gerp_phred=phred_rankscore_col(nsfp[vcf.key].single['GERP++_RS_rankscore' ]),
+        gm_phred=phred_rankscore_col(nsfp[vcf.key].single.GM12878_fitCons_rankscore),
+        h1_phred=phred_rankscore_col(nsfp[vcf.key].single['H1-hESC_fitCons_rankscore' ]),
+        huvec_phred=phred_rankscore_col(nsfp[vcf.key].single.HUVEC_fitCons_rankscore),
+        integraged_phred=phred_rankscore_col(nsfp[vcf.key].single.integrated_fitCons_rankscore),
+    ))
+    vcf = vcf.persist()
+
+    vcf = vcf.annotate(scores=vcf.scores.annotate(
+        list_phred=phred_rankscore_col(nsfp[vcf.key].single['LIST-S2_rankscore' ]),
+        lrt_phred=phred_rankscore_col(nsfp[vcf.key].single.LRT_converted_rankscore),
+        metasvm_phred=phred_rankscore_col(nsfp[vcf.key].single.MetaSVM_rankscore),
+        metalr_phred=phred_rankscore_col(nsfp[vcf.key].single.MetaLR_rankscore),
+        metarnn_phred=phred_rankscore_col(nsfp[vcf.key].single.MetaRNN_rankscore),
+        mpc_phred=phred_rankscore_col(nsfp[vcf.key].single.MPC_rankscore),
+        mvp_phred=phred_rankscore_col(nsfp[vcf.key].single.MVP_rankscore),
+        phylop30_phred=phred_rankscore_col(nsfp[vcf.key].single.phyloP30way_mammalian_rankscore),
+        phylop17_phred=phred_rankscore_col(nsfp[vcf.key].single.phyloP17way_primate_rankscore),
+        phastcons100_phred=phred_rankscore_col(nsfp[vcf.key].single.phastCons100way_vertebrate_rankscore),
+        phastcons30_phred=phred_rankscore_col(nsfp[vcf.key].single.phastCons30way_mammalian_rankscore),
+        phastcons17_phred=phred_rankscore_col(nsfp[vcf.key].single.phastCons17way_primate_rankscore),
+        primateai_phred=phred_rankscore_col(nsfp[vcf.key].single.PrimateAI_rankscore),
+        sciphy_phred=phred_rankscore_col(nsfp[vcf.key].single.SiPhy_29way_logOdds_rankscore),
+    ))
+
+    vcf = vcf.persist()
+
+    adme_score = adme.compute_score(vcf)
+    adme2_score = adme2.compute_score(vcf)
+    vcf = vcf.annotate(scores=vcf.scores.annotate(
+        **adme_score,
+        **adme2_score,
+    ))
+    vcf = vcf.persist()
+
+    # normalize phreds to be 0 - 1
+    def get_stats(ht, name, expr):
+        path = Path(f'tmp/{name}-stats.pkl')
+        if path.is_file():
+            with open(path, 'rb') as f:
+                stats = pickle.load(f)
+        else:
+            if name in ['cadd', 'fathmm_xf']:
+                stats = ht.aggregate(hl.agg.stats(expr))
+            else:
+                stats = ht.aggregate(hl.agg.stats(phred_rankscore_col(expr)))
+            with open(path, 'wb') as f:
+                pickle.dump(stats, f)
+        return stats
+
+    cadd_stats = get_stats(cadd, 'cadd', cadd.score_phred)
+    fathmm_xf_stats = get_stats(fathmm_xf, 'fathmm_xf', fathmm_xf.phred)
+    ma_stats = get_stats(nsfp, 'ma', nsfp.single.MutationAssessor_rankscore)
+    provean_stats = get_stats(nsfp, 'provean', nsfp.single.PROVEAN_converted_rankscore)
+    phylop_stats = get_stats(nsfp, 'phylop', nsfp.single.phyloP100way_vertebrate_rankscore)
+
+    dann_stats = get_stats(nsfp, 'dann', nsfp.single.DANN_rankscore)
+    bayes_noaf_stats = get_stats(nsfp, 'bayes_noaf', nsfp.single.BayesDel_noAF_rankscore)
+    cadd_stats = get_stats(cadd, 'cadd', cadd.score_phred)
+    sift4g_stats = get_stats(nsfp, 'sift4g', nsfp.single.SIFT4G_converted_rankscore)
+    sift_stats = get_stats(nsfp, 'sift', nsfp.single.SIFT_converted_rankscore)
+    fathmm_mkl_stats = get_stats(nsfp, 'fathmm_mkl', nsfp.single['fathmm-MKL_coding_rankscore'])
+    mt_stats = get_stats(nsfp, 'mt', nsfp.single.MutationTaster_converted_rankscore)
+    vest4_stats = get_stats(nsfp, 'vest4', nsfp.single.VEST4_rankscore)
+    lrt_stats = get_stats(nsfp, 'lrt', nsfp.single.LRT_converted_rankscore)
+    bayes_addaf_stats = get_stats(nsfp, 'bayes_addaf', nsfp.single.BayesDel_addAF_rankscore)
+    revel_stats = get_stats(nsfp, 'revel', nsfp.single.REVEL_rankscore)
+    eigen_stats = get_stats(nsfp, 'eigen', nsfp.single['Eigen-raw_coding_rankscore'])
+    eigen_pc_stats = get_stats(nsfp, 'eigen_pc', nsfp.single['Eigen-PC-raw_coding_rankscore'])
+
+
+    bstatistic_stats = get_stats(nsfp, 'bstatistic', nsfp.single.bStatistic_converted_rankscore)
+    clinpred_stats = get_stats(nsfp, 'clinpred', nsfp.single.ClinPred_rankscore)
+    fathmm_stats = get_stats(nsfp, 'fathmm', nsfp.single.FATHMM_converted_rankscore)
+    genocanyon_stats = get_stats(nsfp, 'genocanyon', nsfp.single.GenoCanyon_rankscore)
+    gerp_stats = get_stats(nsfp, 'gerp', nsfp.single['GERP++_RS_rankscore' ])
+    gm_stats = get_stats(nsfp, 'gm', nsfp.single.GM12878_fitCons_rankscore)
+    h1_stats = get_stats(nsfp, 'h1', nsfp.single['H1-hESC_fitCons_rankscore' ])
+    huvec_stats = get_stats(nsfp, 'huvec', nsfp.single.HUVEC_fitCons_rankscore)
+    integraged_stats = get_stats(nsfp, 'integraged', nsfp.single.integrated_fitCons_rankscore)
+    list_stats = get_stats(nsfp, 'list', nsfp.single['LIST-S2_rankscore' ])
+    lrt_stats = get_stats(nsfp, 'lrt', nsfp.single.LRT_converted_rankscore)
+    metasvm_stats = get_stats(nsfp, 'metasvm', nsfp.single.MetaSVM_rankscore)
+    metalr_stats = get_stats(nsfp, 'metalr', nsfp.single.MetaLR_rankscore)
+    metarnn_stats = get_stats(nsfp, 'metarnn', nsfp.single.MetaRNN_rankscore)
+    mpc_stats = get_stats(nsfp, 'mpc', nsfp.single.MPC_rankscore)
+    mvp_stats = get_stats(nsfp, 'mvp', nsfp.single.MVP_rankscore)
+    phylop30_stats = get_stats(nsfp, 'phylop30', nsfp.single.phyloP30way_mammalian_rankscore)
+    phylop17_stats = get_stats(nsfp, 'phylop17', nsfp.single.phyloP17way_primate_rankscore)
+    phastcons100_stats = get_stats(nsfp, 'phastcons100', nsfp.single.phastCons100way_vertebrate_rankscore)
+    phastcons30_stats = get_stats(nsfp, 'phastcons30', nsfp.single.phastCons30way_mammalian_rankscore)
+    phastcons17_stats = get_stats(nsfp, 'phastcons17', nsfp.single.phastCons17way_primate_rankscore)
+    primateai_stats = get_stats(nsfp, 'primateai', nsfp.single.PrimateAI_rankscore)
+    sciphy_stats = get_stats(nsfp, 'sciphy', nsfp.single.SiPhy_29way_logOdds_rankscore)
+
+    def norm_score(expr, clip_max=40, max_val=None):
+        return hl.min(expr, clip_max, filter_missing=False) / hl.min(max_val, clip_max)
+
+    vcf = vcf.annotate(scores=vcf.scores.annotate(
+        cadd_norm=norm_score(vcf.scores.cadd_phred, max_val=cadd_stats['max']),
+        fathmm_xf_norm=norm_score(vcf.scores.fathmm_xf_phred, max_val=fathmm_xf_stats['max']),
+        sift_norm=norm_score(vcf.scores.sift_phred, max_val=sift_stats['max']),
+        ma_norm=norm_score(vcf.scores.ma_phred, max_val=ma_stats['max']),
+        provean_norm=norm_score(vcf.scores.provean_phred, max_val=provean_stats['max']),
+        phylop100_norm=norm_score(vcf.scores.phylop100_phred, max_val=phylop_stats['max']),
+
+        dann_norm=norm_score(vcf.scores.dann_phred, max_val=dann_stats['max']),
+        eigen_pc_norm=norm_score(vcf.scores.eigen_pc_phred, max_val=eigen_pc_stats['max']),
+
+        bstatistic_norm=norm_score(vcf.scores.bstatistic_phred, max_val=bstatistic_stats['max']),
+        clinpred_norm=norm_score(vcf.scores.clinpred_phred, max_val=clinpred_stats['max']),
+        fathmm_norm=norm_score(vcf.scores.fathmm_phred, max_val=fathmm_stats['max']),
+        genocanyon_norm=norm_score(vcf.scores.genocanyon_phred, max_val=genocanyon_stats['max']),
+        gerp_norm=norm_score(vcf.scores.gerp_phred, max_val=gerp_stats['max']),
+        gm_norm=norm_score(vcf.scores.gm_phred, max_val=gm_stats['max']),
+        h1_norm=norm_score(vcf.scores.h1_phred, max_val=h1_stats['max']),
+        huvec_norm=norm_score(vcf.scores.huvec_phred, max_val=huvec_stats['max']),
+        integraged_norm=norm_score(vcf.scores.integraged_phred, max_val=integraged_stats['max']),
+    ))
+    vcf = vcf.persist()
+
+    vcf = vcf.annotate(scores=vcf.scores.annotate(
+        list_norm=norm_score(vcf.scores.list_phred, max_val=list_stats['max']),
+        lrt_norm=norm_score(vcf.scores.lrt_phred, max_val=lrt_stats['max']),
+        metasvm_norm=norm_score(vcf.scores.metasvm_phred, max_val=metasvm_stats['max']),
+        metalr_norm=norm_score(vcf.scores.metalr_phred, max_val=metalr_stats['max']),
+        metarnn_norm=norm_score(vcf.scores.metarnn_phred, max_val=metarnn_stats['max']),
+        mpc_norm=norm_score(vcf.scores.mpc_phred, max_val=mpc_stats['max']),
+        mvp_norm=norm_score(vcf.scores.mvp_phred, max_val=mvp_stats['max']),
+        phylop30_norm=norm_score(vcf.scores.phylop30_phred, max_val=phylop30_stats['max']),
+        phylop17_norm=norm_score(vcf.scores.phylop17_phred, max_val=phylop17_stats['max']),
+        phastcons100_norm=norm_score(vcf.scores.phastcons100_phred, max_val=phastcons100_stats['max']),
+        phastcons30_norm=norm_score(vcf.scores.phastcons30_phred, max_val=phastcons30_stats['max']),
+        phastcons17_norm=norm_score(vcf.scores.phastcons17_phred, max_val=phastcons17_stats['max']),
+        primateai_norm=norm_score(vcf.scores.primateai_phred, max_val=primateai_stats['max']),
+        sciphy_norm=norm_score(vcf.scores.sciphy_phred, max_val=sciphy_stats['max']),
+    ))
+    vcf = vcf.persist()
+
+    return vcf
+
+
+def phred_rankscore_col(column_expr):
+    return -10 * hl.log10(1 - hl.float32(column_expr))
+
+
+def phred_score(ht, score_col_name, out_col_name=None, smaller_more_damaging=False):
+    print(f'{datetime.now()}: start', flush=True)
+    if not out_col_name:
+        out_col_name = f'{score_col_name}_phred'
+
+    undefined_missing_expr = (
+        ~hl.is_finite(ht[score_col_name])
+        | hl.is_missing(ht[score_col_name])
+    )
+    n_undefined_missing = ht.filter(undefined_missing_expr).count()
+    print(n_undefined_missing)
+
+    if smaller_more_damaging:
+        ht = ht.order_by(
+            ~undefined_missing_expr,
+            ht[score_col_name]
+        )
+    else:
+        ht = ht.order_by(
+            ~undefined_missing_expr,
+            hl.desc(ht[score_col_name])
+        )
+
+    ht = ht.persist()
+    print(f'{datetime.now()}: persist 1', flush=True)
+
+    ht = ht.add_index('score_index')
+    ht = ht.persist()
+    print(f'{datetime.now()}: persist 2', flush=True)
+
+    ht_ranks = ht.filter(hl.is_defined(ht[score_col_name]))
+    ht_ranks = (
+        ht_ranks
+        .group_by(ht_ranks[score_col_name])
+        .aggregate(
+            score_min_rank=hl.agg.min(ht_ranks.score_index) + 1 - n_undefined_missing
         )
     )
-
-    DANN._write_as_hailtable(
-        os.path.join(RESOURCES_PATH, 'dann', 'DANN_whole_genome_SNVs.tsv.bgz')
+    n = ht_ranks.aggregate(hl.agg.max(ht_ranks.score_min_rank))
+    ht = ht.annotate(
+        percent_rank=ht_ranks[ht[score_col_name]].score_min_rank / n,
     )
+    ht = ht.transmute(**{
+        out_col_name: -10 * hl.log10(ht.percent_rank)
+    })
+    ht = ht.drop('score_index')
+    ht = ht.persist()
+    print(f'{datetime.now()}: persist 3', flush=True)
 
-    CADD._write_as_hailtable(
-        os.path.join(RESOURCES_PATH, 'cadd', 'whole_genome_SNVs.tsv.gz')
-    )
+    ht = ht.key_by('locus', 'alleles')
+    ht = ht.persist()
+    print(f'{datetime.now()}: persist 4', flush=True)
 
-    PharmGScore._write_as_hailtable(
-        os.path.join(wd, 'data', 'pharmacogenetic-score', 'our-scores.tsv.bgz')
-    )
+    return ht
